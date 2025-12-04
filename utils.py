@@ -25,12 +25,14 @@ if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 
-def load_bitcoin_data(start_date='2020-01-01', end_date=None):
+def load_stock_data(ticker='BTC-USD', start_date='2020-01-01', end_date=None):
     """
-    yfinance를 사용하여 비트코인 데이터를 다운로드합니다.
+    yfinance를 사용하여 주식/암호화폐 데이터를 다운로드합니다.
     
     Parameters:
     -----------
+    ticker : str
+        데이터를 불러올 종목의 티커
     start_date : str
         시작 날짜 (YYYY-MM-DD 형식)
     end_date : str
@@ -39,16 +41,16 @@ def load_bitcoin_data(start_date='2020-01-01', end_date=None):
     Returns:
     --------
     pd.DataFrame
-        비트코인 가격 데이터
+        가격 데이터
     """
     if end_date is None:
         end_date = datetime.now().strftime('%Y-%m-%d')
     
-    print(f"비트코인 데이터 다운로드 중: {start_date} ~ {end_date}")
-    btc_data = yf.download('BTC-USD', start=start_date, end=end_date)
-    print(f"다운로드 완료: {len(btc_data)} 행")
+    print(f"{ticker} 데이터 다운로드 중: {start_date} ~ {end_date}")
+    stock_data = yf.download(ticker, start=start_date, end=end_date)
+    print(f"다운로드 완료: {len(stock_data)} 행") # 변수명 btc_data -> stock_data 로 수정
     
-    return btc_data
+    return stock_data
 
 
 def create_features(df, lookback_days=7):
@@ -83,7 +85,7 @@ def create_features(df, lookback_days=7):
     data['Returns'] = close.pct_change()
     
     # 2. 이동평균
-    for window in [5, 10, 20, 50]:
+    for window in [5, 10, 20, 50, 200]: # 200일 이동평균 추가
         ma = close.rolling(window=window).mean()
         data[f'MA_{window}'] = ma
         data[f'MA_{window}_ratio'] = close / ma
@@ -192,15 +194,12 @@ def prepare_data(data, test_size=0.2, validation_size=0.1):
     tuple
         (X_train, X_val, X_test, y_train, y_val, y_test)
     """
-    # NaN 제거
-    data_clean = data.dropna()
-    
     # 특성과 타겟 분리
-    feature_columns = [col for col in data_clean.columns 
-                      if col not in ['Target', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']]
+    feature_columns = [col for col in data.columns 
+                       if col not in ['Target', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']]
     
-    X = data_clean[feature_columns]
-    y = data_clean['Target']
+    X = data[feature_columns]
+    y = data['Target']
     
     # 시계열 데이터이므로 순차적으로 분할
     train_size = int(len(X) * (1 - test_size - validation_size))
@@ -321,7 +320,7 @@ def compare_models(results_dict):
     plt.show()
 
 
-def plot_price_and_predictions(dates, actual_prices, predictions, model_name='Model'):
+def plot_price_and_predictions(dates, actual_prices, predictions, ticker, model_name='Model'):
     """
     실제 가격과 예측 결과를 시각화합니다.
     
@@ -333,15 +332,17 @@ def plot_price_and_predictions(dates, actual_prices, predictions, model_name='Mo
         실제 가격
     predictions : array-like
         예측 값 (0 또는 1)
+    ticker : str
+        종목 티커
     model_name : str
         모델 이름
     """
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
     
     # 가격 차트
-    ax1.plot(dates, actual_prices, label='BTC Price', color='blue', alpha=0.7)
+    ax1.plot(dates, actual_prices, label=f'{ticker} Price', color='blue', alpha=0.7)
     ax1.set_ylabel('Price (USD)')
-    ax1.set_title(f'{model_name} - Bitcoin Price')
+    ax1.set_title(f'{model_name} - {ticker} Price')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
@@ -411,9 +412,10 @@ def calculate_trading_profit(y_true, y_pred, initial_capital=10000):
 
 
 def simulate_trading_strategy(predictions, actual_prices, dates, initial_capital=10000, 
-                             transaction_fee=0.001, strategy_type='simple'):
+                             transaction_fee=0.001, ma_200=None, buy_threshold=0.5):
     """
-    실제 가격 데이터를 사용한 트레이딩 시뮬레이션
+    실제 가격 데이터를 사용한 트레이딩 시뮬레이션.
+    추세 추종 필터(200일 이평선)와 예측 확률을 기반으로 거래를 결정합니다.
     
     Parameters:
     -----------
@@ -423,16 +425,14 @@ def simulate_trading_strategy(predictions, actual_prices, dates, initial_capital
         실제 가격 데이터
     dates : array-like
         날짜 데이터
+    ma_200 : array-like
+        장기 이동평균선 데이터 (e.g., 200일)
     initial_capital : float
         초기 자본 ($)
     transaction_fee : float
         거래 수수료 비율 (기본 0.1%)
-    strategy_type : str
-        'simple': 단순 매수/관망
-        'long_short': 롱/숏 전략
-        
-    Returns:
-    --------
+    buy_threshold : float
+        이 확률을 넘으면 매수 신호로 간주
     dict
         트레이딩 결과 상세 정보
     """
@@ -440,6 +440,9 @@ def simulate_trading_strategy(predictions, actual_prices, dates, initial_capital
     btc_holdings = 0  # 보유 BTC 수량
     portfolio_values = []
     trade_log = []
+
+    if ma_200 is None:
+        raise ValueError("ma_200 (200일 이동평균선) 데이터가 전달되지 않았습니다.")
     
     for i in range(len(predictions)):
         current_price = actual_prices[i]
@@ -448,80 +451,59 @@ def simulate_trading_strategy(predictions, actual_prices, dates, initial_capital
         # 포트폴리오 가치 = 현금 + BTC 보유량 * 현재가
         portfolio_value = cash + btc_holdings * current_price
         portfolio_values.append(portfolio_value)
+        current_ma_200 = ma_200[i]
         
-        # 마지막 날은 거래하지 않음
-        if i == len(predictions) - 1:
-            # 보유 BTC 전량 매도
-            if btc_holdings > 0:
-                sell_value = btc_holdings * current_price * (1 - transaction_fee)
-                cash += sell_value
-                trade_log.append({
-                    'date': dates[i],
-                    'action': 'SELL_ALL',
-                    'price': current_price,
-                    'amount': btc_holdings,
-                    'value': sell_value,
-                    'cash': cash,
-                    'portfolio_value': cash
-                })
-                btc_holdings = 0
+        if np.isnan(current_ma_200):
             continue
         
-        if strategy_type == 'simple':
-            # 단순 전략: 상승 예측 시 매수, 하락 예측 시 보유 BTC 매도
-            if pred == 1:  # 상승 예측
-                if cash > 0:
-                    # 전체 현금으로 BTC 매수
+        # 추세 추종 필터 전략
+        is_bull_market = current_price > current_ma_200
+
+        if is_bull_market:
+            # --- 강세장 전략 ---
+            # 1. 매수: 상승 예측 시, 현금이 있으면 전량 매수
+            if pred > buy_threshold and cash > 0:
+                    fee = cash * transaction_fee
                     buy_amount = (cash * (1 - transaction_fee)) / current_price
                     btc_holdings += buy_amount
                     trade_log.append({
-                        'date': dates[i],
-                        'action': 'BUY',
-                        'price': current_price,
-                        'amount': buy_amount,
-                        'value': cash,
-                        'cash': 0,
+                        'date': dates[i], 'action': 'BUY (Bull)', 'price': current_price,
+                        'amount': buy_amount, 'value': cash, 'fee': fee, 'cash': 0,
                         'portfolio_value': portfolio_value
                     })
                     cash = 0
-            else:  # 하락 예측
-                if btc_holdings > 0:
-                    # 보유 BTC 전량 매도
+            # 2. 매도: 하지 않음 (수익 극대화를 위해 보유)
+
+        else:
+            # --- 약세장 전략 ---
+            # 1. 매수: 하지 않음
+            # 2. 매도: 하락 예측 시, 보유 주식이 있으면 전량 매도
+            if pred < buy_threshold and btc_holdings > 0:
+                    pre_fee_value = btc_holdings * current_price
+                    fee = pre_fee_value * transaction_fee
                     sell_value = btc_holdings * current_price * (1 - transaction_fee)
                     cash += sell_value
                     trade_log.append({
-                        'date': dates[i],
-                        'action': 'SELL',
-                        'price': current_price,
-                        'amount': btc_holdings,
-                        'value': sell_value,
-                        'cash': cash,
+                        'date': dates[i], 'action': 'SELL (Bear)', 'price': current_price,
+                        'amount': btc_holdings, 'value': sell_value, 'fee': fee, 'cash': cash,
                         'portfolio_value': portfolio_value
                     })
                     btc_holdings = 0
     
-    final_value = portfolio_values[-1]
+    # 시뮬레이션 종료 후 최종 가치 계산
+    final_value = cash + btc_holdings * actual_prices[-1]
     total_return = (final_value - initial_capital) / initial_capital * 100
     
-    # 벤치마크 계산 (Buy and Hold)
-    btc_buy_and_hold = (initial_capital * (1 - transaction_fee)) / actual_prices[0]
-    buy_and_hold_value = btc_buy_and_hold * actual_prices[-1] * (1 - transaction_fee)
-    buy_and_hold_return = (buy_and_hold_value - initial_capital) / initial_capital * 100
-    
-    # 총 거래 금액 계산 (수수료 부과 기준)
-    total_trade_volume = sum(trade['value'] for trade in trade_log if trade['action'] in ['BUY', 'SELL'])
-    total_fees_paid = total_trade_volume * transaction_fee
+    # 총 지불 수수료 계산
+    total_fees_paid = sum(trade.get('fee', 0) for trade in trade_log)
 
     result = {
         'initial_capital': initial_capital,
         'final_value': final_value,
         'total_return': total_return,
-        'buy_and_hold_return': buy_and_hold_return,
-        'excess_return': total_return - buy_and_hold_return,
         'portfolio_values': portfolio_values,
         'trade_log': trade_log,
         'num_trades': len(trade_log),
-        'total_trade_volume': total_trade_volume,
         'total_fees_paid': total_fees_paid,
         'dates': dates
     }
@@ -577,11 +559,11 @@ def compare_trading_strategies(results_dict):
     for strategy_name, result in results_dict.items():
         comparison_data.append({
             'Strategy': strategy_name,
-            'Initial Capital': f"${result['initial_capital']:,.2f}",
-            'Final Value': f"${result['final_value']:,.2f}",
+            'Initial Capital': f"${result['initial_capital']:,.0f}",
+            'Final Value': f"${result['final_value']:,.0f}",
             'Total Return (%)': f"{result['total_return']:.2f}",
             'Num Trades': result.get('num_trades', 'N/A'),
-            'Total Fees': f"${result.get('total_fees_paid', 0):,.2f}" if 'total_fees_paid' in result else 'N/A'
+            'Total Fees': f"${result.get('total_fees_paid', 0):,.0f}" if 'total_fees_paid' in result else 'N/A'
         })
 
     df = pd.DataFrame(comparison_data)
@@ -595,7 +577,7 @@ def compare_trading_strategies(results_dict):
     return df
 
 
-def plot_trading_results(results_dict):
+def plot_trading_results(results_dict, save_path=None):
     """
     트레이딩 결과를 시각화합니다.
     
@@ -603,6 +585,8 @@ def plot_trading_results(results_dict):
     -----------
     results_dict : dict
         {전략명: 결과} 형태의 딕셔너리
+    save_path : str, optional
+        그래프를 저장할 파일 경로. None이면 저장하지 않음.
     """
     fig, axes = plt.subplots(2, 1, figsize=(15, 10))
     
@@ -638,6 +622,11 @@ def plot_trading_results(results_dict):
         axes[1].text(i, ret, f'{ret:.2f}%', ha='center', 
                     va='bottom' if ret > 0 else 'top', fontweight='bold')
     
+    # 그래프 파일로 저장
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight')
+        print(f"\n그래프가 '{save_path}' 파일로 저장되었습니다.")
+
     plt.tight_layout()
     plt.show()
 
@@ -916,4 +905,3 @@ def predict_pytorch_model(model, data_loader):
     binary_predictions = (predictions > 0.5).astype(int).flatten()
     
     return predictions.flatten(), binary_predictions
-
